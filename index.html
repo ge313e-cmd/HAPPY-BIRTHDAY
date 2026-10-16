@@ -47,7 +47,9 @@
   .cake-sub { font-size: .95rem; opacity: .75; min-height: 1.3rem; max-width: 300px; }
   .cake-skip { font: inherit; font-size: .9rem; color: #ffe3ec; background: none; border: 1px solid rgba(255,227,236,.5);
                border-radius: 99px; padding: .4rem 1.1rem; cursor: pointer; margin-top: .4rem; }
-  .cake-skip[hidden] { display: none; }
+  .cake-skip[hidden], .meter[hidden] { display: none; }
+  .meter { width: 180px; height: 6px; border-radius: 99px; background: rgba(255,255,255,.15); overflow: hidden; }
+  .meter i { display: block; height: 100%; width: 0; background: #ff8fb1; }
 
   .lean  { transform: rotate(calc(var(--lean, 0) * -30deg)) scale(1, calc(1 - var(--lean, 0) * .35)); }
   .flame { transform: scale(0); }
@@ -99,6 +101,7 @@
   </div>
   <p class="cake-text" id="cakeText"></p>
   <p class="cake-sub" id="cakeSub"></p>
+  <div class="meter" id="meter" hidden><i id="meterBar"></i></div>
   <button class="cake-skip" id="cakeSkip" hidden>Mic not working? Tap here</button>
 </div>
 
@@ -293,6 +296,7 @@ const cakeText = document.getElementById("cakeText"), cakeSub = document.getElem
 let cakeState = "idle", pendingLeaf = null, skipTimer = null;
 const song = document.getElementById("song");
 let micStream = null, audioCtx = null, analyser = null, micBuf = null, micOk = false, micFailed = false;
+const meter = document.getElementById("meter"), meterBar = document.getElementById("meterBar");
 let calib = { t: 0, sum: 0, n: 0, base: .02 }, blowAcc = 0, lean = 0;
 
 function updateSub() {
@@ -304,15 +308,17 @@ function updateSub() {
 async function startMic() {
   micOk = micFailed = false;
   try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AC(); if (audioCtx.resume) audioCtx.resume();      // created inside the tap on purpose
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("no mic api");
     micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
-    const AC = window.AudioContext || window.webkitAudioContext;
-    audioCtx = new AC(); if (audioCtx.state === "suspended") await audioCtx.resume();
-    analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024;
+    if (audioCtx.state !== "running") await audioCtx.resume();
+    analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024; analyser.smoothingTimeConstant = 0;
     audioCtx.createMediaStreamSource(micStream).connect(analyser);
-    micBuf = new Float32Array(analyser.fftSize);
+    micBuf = new Uint8Array(analyser.fftSize);
     calib = { t: 0, sum: 0, n: 0, base: .02 }; blowAcc = 0; lean = 0; micOk = true;
-  } catch (e) { micFailed = true; skipBtn.hidden = false; }
+    meter.hidden = false;
+  } catch (e) { console.warn("Mic error:", e); micFailed = true; skipBtn.hidden = false; }
   updateSub();
 }
 function stopMic() {
@@ -322,19 +328,21 @@ function stopMic() {
   micStream = audioCtx = analyser = null;
 }
 function tickBlow(dt) {
-  analyser.getFloatTimeDomainData(micBuf);
-  let sum = 0; for (let i = 0; i < micBuf.length; i++) sum += micBuf[i] * micBuf[i];
+  analyser.getByteTimeDomainData(micBuf);
+  let sum = 0; for (let i = 0; i < micBuf.length; i++) { const v = (micBuf[i] - 128) / 128; sum += v * v; }
   const rms = Math.sqrt(sum / micBuf.length);
-  if (calib.t < .6) { calib.t += dt; calib.sum += rms; calib.n++; calib.base = Math.min(.12, calib.sum / calib.n); return; }
-  const over = rms > calib.base + .09;
+  if (calib.t < .5) { calib.t += dt; calib.sum += rms; calib.n++; calib.base = Math.min(.12, calib.sum / calib.n); return; }
+  const over = rms > calib.base + .035;
+  if (!over) calib.base += (rms - calib.base) * Math.min(1, dt * 1.5);   // floor follows the song / room noise
   blowAcc = over ? blowAcc + dt : Math.max(0, blowAcc - dt * 1.5);
-  lean += (clamp((rms - calib.base) / .3) - lean) * Math.min(1, dt * 12);
+  lean += (clamp((rms - calib.base) / .25) - lean) * Math.min(1, dt * 12);
   cakeEl.style.setProperty("--lean", lean.toFixed(3));
-  if (blowAcc > .45) extinguish();
+  meterBar.style.width = Math.round(clamp(blowAcc / .35) * 100) + "%";
+  if (blowAcc > .35) extinguish();
 }
 function openCake(l) {
   cakeState = "drop"; pendingLeaf = { msg: l.msg, hit: { x: l.hit.x, y: l.hit.y }, seen: true }; l.seen = true;
-  hint.style.opacity = 0; skipBtn.hidden = true; cakeSub.textContent = ""; cakeText.textContent = "Make a wish";
+  hint.style.opacity = 0; skipBtn.hidden = true; meter.hidden = true; meterBar.style.width = "0%"; cakeSub.textContent = ""; cakeText.textContent = "Make a wish";
   cakeEl.classList.remove("lit", "out"); cakeEl.style.setProperty("--lean", 0);
   wrap.classList.remove("away"); layer.classList.remove("fade"); layer.classList.add("show");
   startMic();                                   // must run inside the tap so the browser allows the mic prompt
@@ -351,7 +359,7 @@ function extinguish() {
   cakeState = "out"; clearTimeout(skipTimer); stopMic();
   fadeSongUp();
   cakeEl.classList.add("out"); cakeEl.style.setProperty("--lean", 0);
-  cakeText.textContent = ""; cakeSub.textContent = ""; skipBtn.hidden = true;
+  cakeText.textContent = ""; cakeSub.textContent = ""; skipBtn.hidden = true; meter.hidden = true;
   setTimeout(() => { wrap.classList.add("away"); layer.classList.add("fade"); }, 1200);
   setTimeout(() => { layer.classList.remove("show"); cakeState = "idle"; showCard(pendingLeaf); }, 1750);
 }
@@ -361,12 +369,18 @@ function fadeSongUp() {
 }
 
 
+let ignoreClick = false;
+cv.addEventListener("click", e => {
+  if (ignoreClick) { ignoreClick = false; return; }
+  if (cakeState !== "idle" || card.classList.contains("show")) return;
+  const l = leafAt(e.clientX, e.clientY); if (l) openCake(l);
+});
 cv.addEventListener("pointerdown", e => {
-  e.preventDefault();
+  ignoreClick = false;
   if (cakeState !== "idle") return;
-  if (card.classList.contains("show")) { hideCard(); return; }
+  if (card.classList.contains("show")) { hideCard(); ignoreClick = true; return; }
   const l = leafAt(e.clientX, e.clientY);
-  if (l) { openCake(l); return; }
+  if (l) return;                       // leaf taps are handled in the click handler above
   plant(e.clientX, e.clientY);
   if (phase === 0) { phase = 1; hint.style.opacity = 0; }
 });
